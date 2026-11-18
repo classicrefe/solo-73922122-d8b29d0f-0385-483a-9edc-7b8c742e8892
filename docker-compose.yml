@@ -1,0 +1,21 @@
+services:
+  subset-api:
+    build: .
+    image: subset-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # 上传上限 256 MiB（需求固定值，可按需覆盖）
+      MAX_UPLOAD_BYTES: "268435456"
+      # 可控慢扫描默认关闭；演示时改为例如 20（每行 20ms）
+      SCAN_ROW_DELAY_MS: "0"
+      SCAN_DELAY_EVERY_ROWS: "1"
+    volumes:
+      - subset-data:/data
+    mem_limit: 128m
+    mem_reservation: 64m
+    restart: unless-stopped
+
+volumes:
+  subset-data:
