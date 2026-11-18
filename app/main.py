@@ -152,20 +152,22 @@ async def upload_source(
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="空文件或缺少表头")
 
+    # 表单未显式指定时回退到全局默认（环境变量 SCAN_ROW_DELAY_MS）
+    effective_delay = row_delay_ms or config.SCAN_ROW_DELAY_MS
     app.state.db.insert_source(
         source_id,
         file.filename or "upload.csv",
         total,
         sha.hexdigest(),
         _now(),
-        row_delay_ms,
+        effective_delay,
     )
     return {
         "source_id": source_id,
         "filename": file.filename,
         "size_bytes": total,
         "sha256": sha.hexdigest(),
-        "row_delay_ms": row_delay_ms,
+        "row_delay_ms": effective_delay,
     }
 
 

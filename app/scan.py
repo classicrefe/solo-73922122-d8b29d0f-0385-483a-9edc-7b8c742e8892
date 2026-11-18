@@ -5,13 +5,16 @@
 * 一个 source 同一时刻最多有一个活跃 ScanController（一代扫描，目录
   scans/<source_id>/gen<N>/）。同原件的在途任务都作为 Subscriber 挂到
   该控制器上，扫描线程只对原件做一次顺序读取。
-* 扫描线程把读入的每行原始字节写入本代 spool（磁盘日志），并即时投递给
-  所有订阅者；订阅者各自按自己的条件筛行，写自己的暂存 CSV。
-* 途中加入的订阅者先按 spool 已确认大小补读“已过部分”，再转入在线投递；
-  补读期间扫描线程会在追上点处等待，保证不会漏行，且全程不二次读取原件。
+* 扫描线程按**完整 CSV 记录**处理原件：引号字段内的换行属于记录内容，
+  不会被拆成两行。每条记录的原始字节写入本代 spool（磁盘日志），并把
+  记录文本即时投递给所有订阅者；订阅者各自按自己的条件筛选，写自己的
+  暂存 CSV，匹配记录按原始字节（含引号内换行与原终止符）写出。
+* 途中加入的订阅者先按 spool 已确认大小补读“已过部分”的完整记录，再转入
+  在线投递；补读期间扫描线程会在追上点处等待，保证不会漏记录，且全程不
+  二次读取原件。
 * 只有整份原件解析通过后，订阅者才会把暂存原子改名为结果文件并置
-  completed；任一行格式错误或扫描异常，本代所有未完任务 failed，
-  不提供部分结果。
+  completed；任一记录格式错误（含引号未闭合）或扫描异常，本代所有未完
+  任务 failed，不提供部分结果。
 * 取消只影响本任务；最后一个活跃任务取消时，扫描线程在下一个检查点真正
   停止并清空本代暂存目录后，任务才以 cancelled 落库。
 * 收尾期间允许受理新任务：管理器为其建立新一代扫描，旧扫描的清理只动
@@ -28,15 +31,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
-from .csvutil import HEADER, CsvFormatError, parse_row, row_matches, validate_header
+from .csvutil import (
+    HEADER,
+    CsvFormatError,
+    RecordSplitter,
+    count_line_breaks,
+    decode_record,
+    parse_row,
+    row_matches,
+    validate_header,
+)
 from .db import Database
 
 # 取消/结束事件的轮询粒度，保证“及时受理”
 POLL_INTERVAL = 0.05
-# spool 落盘批量：行数或字节数任一达到即 flush。
-# 只在 flush 后推进 spool_size，保证订阅者不会读到半行。
+# spool 落盘批量：记录数或字节数任一达到即 flush。
+# 只在 flush 后推进 spool_size，保证订阅者不会读到半条记录。
 SPOOL_FLUSH_BYTES = 256 * 1024
 SPOOL_FLUSH_ROWS = 32
+# 原件顺序读取的分块大小（记录切分与分块边界无关）
+SCAN_CHUNK_BYTES = 1024 * 1024
+# 订阅者补读 spool 的分块大小
+CATCHUP_CHUNK_BYTES = 64 * 1024
 
 
 def _now() -> str:
@@ -76,7 +92,7 @@ class TaskState:
 
 
 class Subscriber:
-    """订阅一次扫描的单个任务：负责补读 spool、在线筛行与结果落盘。"""
+    """订阅一次扫描的单个任务：负责补读 spool、在线筛选与结果落盘。"""
 
     def __init__(self, state: TaskState, controller: "ScanController", db: Database):
         self.state = state
@@ -126,7 +142,7 @@ class Subscriber:
         ctl = self.controller
         try:
             self._open_staging()
-            # 1) 补读加入之前已经扫过的部分（来自 spool，不碰原件）
+            # 1) 补读加入之前已经扫过的完整记录（来自 spool，不碰原件）
             self._catch_up()
             # 2) 等待在线投递，直到扫描进入终态
             with ctl.cond:
@@ -166,42 +182,58 @@ class Subscriber:
         self._file.write(",".join(HEADER) + "\r\n")
 
     def _catch_up(self) -> None:
-        """补齐加入前已扫过的行；扫描线程会在追上点等待。
+        """补齐加入前已扫过的完整记录；扫描线程会在追上点等待。
 
-        已扫行分两部分：
-        1. 已 flush 进 spool 文件的部分——只读 spool_size 确认字节，绝不会读到半行；
-        2. 扫描线程内存 _pending 中尚未 flush 的部分——在同一把条件锁内做一致性
-           快照（flush 会把 pending 原子地转入 spool，二者不会重复也不会遗漏）。
-        读取期间若 spool 增长，外层循环继续直到追平最新确认位置，保证不漏行。
-        全程只读 spool 与内存缓冲，不二次打开原件。
+        已扫记录分两部分：
+        1. 已 flush 进 spool 文件的部分——只读 spool_size 确认字节，绝不会
+           读到半条记录；
+        2. 扫描线程内存 _pending 中尚未 flush 的部分。
+
+        扫描线程发现补读中的订阅者后会停在检查点，spool_size 与 _pending
+        随之冻结。为避免读到“flush 途中”的不一致快照（漏记录或重复记录），
+        每轮读完 spool 后在同一把锁内复核 spool_size 与 _pending_rows 均未
+        变化，确认一致后才消费 pending 快照；不一致则说明扫描线程尚未停稳，
+        继续读增量重试。全程只读 spool 与内存缓冲，不二次打开原件。
         """
         ctl = self.controller
-        with ctl.cond:
-            confirmed = ctl.spool_size
-            # 与 spool_size 在同一把锁内快照，flush 的原子性保证二者不重不漏
-            pending_snapshot = b"".join(ctl._pending).decode("utf-8")
+        splitter = RecordSplitter()
+        snapshot: bytes | None = None
         with open(ctl.spool_path, "rb") as spool:
             while not self.cancel_requested:
                 with ctl.cond:
                     confirmed = ctl.spool_size
-                if spool.tell() >= confirmed:
-                    break
-                line = spool.readline()
-                if not line:
-                    break
-                self._handle_line(line.decode("utf-8"))
-        # 扫描线程在 catching_up 期间停在下一行的检查点，pending 不会再变化；
-        # 快照中的行在线投递阶段已被跳过，这里恰好补一次。
-        if not self.cancel_requested:
-            for line in pending_snapshot.splitlines(keepends=True):
-                self._handle_line(line)
+                    pending_rows = ctl._pending_rows
+                while spool.tell() < confirmed and not self.cancel_requested:
+                    chunk = spool.read(
+                        min(CATCHUP_CHUNK_BYTES, confirmed - spool.tell())
+                    )
+                    if not chunk:
+                        break  # 极端时序下暂不可见，下一轮重试
+                    for rec in splitter.feed(chunk):
+                        self._handle_record(decode_record(rec, -1))
+                with ctl.cond:
+                    if (
+                        ctl.spool_size == confirmed
+                        and ctl._pending_rows == pending_rows
+                    ):
+                        # 状态在读取期间未变：快照与 spool 不重不漏
+                        snapshot = b"".join(ctl._pending)
+                        break
+        if not self.cancel_requested and snapshot is not None:
+            # pending 快照紧接 spool 确认字节之后，沿用同一切分器保持字节流连续
+            for rec in splitter.feed(snapshot):
+                self._handle_record(decode_record(rec, -1))
+            # spool 确认边界必为记录边界；仅 \r 结尾的记录可能滞留
+            tail = splitter.flush_record_boundary()
+            if tail is not None:
+                self._handle_record(decode_record(tail, -1))
         with ctl.cond:
             self.catching_up = False
             ctl.cond.notify_all()
 
-    def _handle_line(self, line: str) -> None:
-        """对一行执行本任务的筛选并写暂存。行内容已由扫描线程校验。"""
-        station, _dt, temperature = parse_row(line, -1)
+    def _handle_record(self, record: str) -> None:
+        """对一条完整记录执行本任务的筛选并写暂存。记录已由扫描线程校验。"""
+        station, _dt, temperature = parse_row(record, -1)
         if row_matches(
             station,
             temperature,
@@ -211,7 +243,12 @@ class Subscriber:
         ):
             with self._io_lock:
                 if self._file is not None:
-                    self._file.write(line if line.endswith("\n") else line + "\r\n")
+                    # 原始记录文本（含引号内换行）原样写出；仅原件末尾
+                    # 无终止符的记录补一个 CRLF，保证结果文件行界完整。
+                    if record.endswith(("\n", "\r")):
+                        self._file.write(record)
+                    else:
+                        self._file.write(record + "\r\n")
                     self.state.matched_rows += 1
 
     # -- 终态处理 ----------------------------------------------------------
@@ -288,6 +325,8 @@ class ScanController:
         self.dir = config.SCANS_DIR / source_id / f"gen{generation}"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.spool_path = self.dir / "spool.csv"
+        # 先建好空 spool，订阅者随时可打开补读，不存在“文件尚未创建”的窗口
+        self.spool_path.touch()
         self.source_path = source_path
         self.row_delay_ms = row_delay_ms
 
@@ -299,7 +338,7 @@ class ScanController:
         self.spool_size = 0  # 已 flush 的 spool 字节数（订阅者可安全读到这里）
         self.all_left = threading.Event()
         self.terminated = threading.Event()
-        self.scanned_rows = 0  # 已从原件读取的数据行数（进度观测）
+        self.scanned_rows = 0  # 已从原件读取的数据记录数（进度观测）
         self._pending: list[bytes] = []
         self._pending_bytes = 0
         self._pending_rows = 0
@@ -328,40 +367,69 @@ class ScanController:
             self._terminate()
 
     def _scan(self) -> None:
-        with open(self.source_path, "r", encoding="utf-8", newline="") as src, open(
+        """顺序读取原件一次，按完整记录校验、投递并写 spool。"""
+        splitter = RecordSplitter()
+        line_no = 0  # 已确认结束的物理行数（表头计入）
+        header_checked = False
+        with open(self.source_path, "rb") as src, open(
             self.spool_path, "wb"
         ) as spool:
-            header_line = src.readline()
-            if not header_line:
-                raise CsvFormatError("空文件，缺少表头")
-            validate_header(header_line)
-
-            line_no = 1
-            for raw_line in src:
-                line_no += 1
-                self.scanned_rows = line_no - 1
-                # 取消检查点：最后一个订阅者离开后尽快停下
-                with self.cond:
-                    while self._has_catching_up_subscriber():
-                        self.cond.wait(timeout=POLL_INTERVAL)
-                    if self._stop_requested:
+            while True:
+                chunk = src.read(SCAN_CHUNK_BYTES)
+                if not chunk:
+                    break
+                for rec in splitter.feed(chunk):
+                    rec_start = line_no + 1
+                    line_no += count_line_breaks(rec)
+                    if not header_checked:
+                        header_checked = True
+                        validate_header(decode_record(rec, rec_start))
+                        continue
+                    if not self._scan_one_record(rec, rec_start, spool):
                         self._enter_aborted()
                         return
-                # 校验：整份原件全部合法才允许产出结果
-                parse_row(raw_line, line_no)
-
-                self._dispatch(raw_line)
-                self._buffer_for_spool(raw_line, spool)
-
-                if self.row_delay_ms > 0 and line_no % config.SCAN_DELAY_EVERY_ROWS == 0:
-                    self._interruptible_sleep(self.row_delay_ms / 1000.0)
-
+            # 末尾无终止符的记录；引号未闭合在此抛格式错误
+            try:
+                tail = splitter.finalize()
+            except CsvFormatError as exc:
+                raise CsvFormatError(f"第 {line_no + 1} 行：{exc}") from exc
+            if tail is not None:
+                rec_start = line_no + 1
+                if not header_checked:
+                    header_checked = True
+                    validate_header(decode_record(tail, rec_start))
+                elif not self._scan_one_record(tail, rec_start, spool):
+                    self._enter_aborted()
+                    return
+            if not header_checked:
+                raise CsvFormatError("空文件，缺少表头")
             self._flush_spool(spool)
 
         with self.cond:
             self.state = "complete"
             self.cond.notify_all()
         self.db.set_source_status(self.source_id, "validated")
+
+    def _scan_one_record(self, rec: bytes, rec_start: int, spool) -> bool:
+        """校验、投递并暂存一条数据记录；返回 False 表示收到停止请求。"""
+        self.scanned_rows += 1
+        # 取消检查点：最后一个订阅者离开后尽快停下；
+        # 有订阅者补读时在此等待，保证其追上前不漏记录
+        with self.cond:
+            while self._has_catching_up_subscriber():
+                self.cond.wait(timeout=POLL_INTERVAL)
+            if self._stop_requested:
+                return False
+        # 校验：整份原件全部合法才允许产出结果
+        record_text = decode_record(rec, rec_start)
+        parse_row(record_text, rec_start)
+
+        self._dispatch(record_text)
+        self._buffer_for_spool(rec, spool)
+
+        if self.row_delay_ms > 0 and self.scanned_rows % config.SCAN_DELAY_EVERY_ROWS == 0:
+            self._interruptible_sleep(self.row_delay_ms / 1000.0)
+        return True
 
     def _has_catching_up_subscriber(self) -> bool:
         return any(s.catching_up for s in self.subscribers)
@@ -374,20 +442,20 @@ class ScanController:
                     return
                 self.cond.wait(timeout=min(POLL_INTERVAL, deadline - time.monotonic()))
 
-    def _dispatch(self, line: str) -> None:
-        """把一行在线投递给已完成补读的订阅者。"""
+    def _dispatch(self, record: str) -> None:
+        """把一条记录在线投递给已完成补读的订阅者。"""
         for sub in list(self.subscribers):
             if sub.catching_up or sub.cancel_requested:
                 continue
             try:
-                sub._handle_line(line)
+                sub._handle_record(record)
             except Exception as exc:  # 单个任务异常不拖垮整代扫描
                 sub._finish_failed(f"任务处理异常: {exc!r}")
 
-    def _buffer_for_spool(self, raw_line: str, spool) -> None:
-        # spool 以二进制追加，统一编码为 UTF-8，保留原件原始换行符
-        self._pending.append(raw_line.encode("utf-8"))
-        self._pending_bytes += len(self._pending[-1])
+    def _buffer_for_spool(self, rec: bytes, spool) -> None:
+        # spool 以二进制追加记录原始字节，保留原件原始换行符与引号
+        self._pending.append(rec)
+        self._pending_bytes += len(rec)
         self._pending_rows += 1
         if (
             self._pending_bytes >= SPOOL_FLUSH_BYTES
